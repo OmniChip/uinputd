@@ -1,0 +1,6 @@
+#!/bin/bash
+D=$(dirname "$0")
+F=${1:-rtdata.csv}
+set -x
+eval "V=($("$D"/data-convert --styles $(cut -f1 -d, "$F" |sort -u)))"
+"$D"/data-convert < "$F" | feedgnuplot --domain --dataid --autolegend --lines "${V[@]}"

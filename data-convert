@@ -1,0 +1,252 @@
+#!/usr/bin/python3 -u
+from collections import defaultdict, namedtuple
+from itertools import chain, count, starmap
+from math import sqrt
+from operator import itemgetter
+from sys import argv, stdin, stdout
+
+def hypot(*coord):
+    return sqrt(sum(map(lambda x: x*x, coord)))
+
+DataTuple = namedtuple('DataTuple', ['ts', 'ax', 'ay', 'az', 'gx', 'gy', 'gz'])
+
+class BandProcessor:
+    stream_id = count()
+
+    ONE_G = 2048
+
+    SQUAT_UDTIME_MIN_PCT = .70
+    SQUAT_POS_MAX = 30
+    SQUAT_SPD_MAX = 25
+    SQUAT_TIME_MIN = 0.5
+    SQUAT_LOW_POS_MAX = -100
+    SQUAT_ROT_M = 1/50000
+
+    UD_UP_THRESH = 200
+    UD_DOWN_THRESH = -200
+    UD_HIST = 100
+    UD_SIDE_ROT2_MAX = 400 * 400
+    WINDOW_TLEN = 5 # sec
+    RESET_TLEN = 0.5 # sec
+
+    PLOT_VALUES = (
+            ("A",       'dt 2', lambda d: d.av),
+    #       ("G",       'dt 2', lambda d: d.gv),
+    #       ("Gy",      'dt 2', lambda d: abs(d.prev.gy)),
+            ("Gy2",     'dt 2', lambda d: d.prev.gy*d.prev.gy / 1000),
+            ("Gxz2",    'dt 2', lambda d: (d.prev.gx*d.prev.gx+d.prev.gz*d.prev.gz) / 1000),
+            ("U",       None,   lambda d: d.updown * 1000),
+    #       ("Nu", lambda d: d.ups * 10),
+    #       ("Nd", lambda d: d.downs * 10),
+    #       ("N", lambda d: (d.ups - d.downs) * 10),
+    #       ("Iu",      None,   lambda d: d.intups / 100),
+    #       ("Id",      None,   lambda d: -d.intdowns / 100),
+    #       ("I",       None,   lambda d: (d.intups + d.intdowns) / 100),
+    #       ("Ig",      None,   lambda d: d.gint / 100),
+    #       ("Ig_y_2",  None,   lambda d: d.gyint2 / 100000),
+            ("V",       None,   lambda d: d.spd * 10),
+            ("S",       None,   lambda d: d.pos * 10),
+            ("Tp",      None,   lambda d: d.udtime / (d.prev.ts - d.last_reset) * 1000 if d.last_reset < d.prev.ts else 0),
+            ("SQUAT",   None,   lambda d: 1000 if d.valid_squat else 0),
+            ("Smin",    None,   lambda d: d.min_pos * 10),
+    )
+
+    @staticmethod
+    def line_styles(name):
+        if name:
+            name = BandProcessor.__mangle_name(name)
+        return starmap(lambda n, s, _: (n + name, s), filter(itemgetter(1), BandProcessor.PLOT_VALUES))
+
+    def __init__(self):
+            self.id = next(self.stream_id)
+            self.name = None
+            self.buf = []
+            self.window = []
+            self.prev = None
+
+            self.updown = 0
+            self.av = 0
+            self.gv = 0
+            self.ups = 0
+            self.downs = 0
+            self.intups = 0
+            self.intdowns = 0
+            self.gint = 0
+            self.gyint = 0
+            self.gyint2 = 0
+            self.udtime = 0
+            self.last_reset = None
+            self.last_squat = None
+            self.min_pos = 0
+
+            self.prev_av = 0
+            self.spd = 0
+            self.pos = 0
+
+    @staticmethod
+    def __mangle_name(name):
+        return '_{' + name.strip('"').replace('_', '-').replace('--', '/') + '}'
+
+    def set_name(self, name):
+        if self.name is not None:
+            return self
+        self.name = self.__mangle_name(name)
+        return self
+
+    @property
+    def valid_squat(self):
+        if self.last_reset is None:
+            return False
+        ref_ts = self.last_reset
+        if self.last_squat is not None and self.last_squat < self.prev.ts:
+            ref_ts = max(ref_ts, self.last_squat)
+        duration = self.prev.ts - ref_ts
+        if duration < self.SQUAT_TIME_MIN:
+            return False
+        if self.udtime < duration * self.SQUAT_UDTIME_MIN_PCT:
+            return False
+        if abs(self.pos) > self.SQUAT_POS_MAX:
+            return False
+        if abs(self.spd) > self.SQUAT_SPD_MAX:
+            return False
+        if self.min_pos > self.SQUAT_LOW_POS_MAX:
+            return False
+        return True
+
+    # integrate [vt+wd - wt]/d for t from 0 to d
+    # DV = d*(v + w)/2
+
+    # integrate [vt+wd - wt]/d for t
+    # v = t^2/2*(v - w)/d + tw + C
+    
+    # integrate [t^2/2*(v-w)/d +tw + p] for t from 0 to d
+    # s = d^2/6*(v+2w) + dp
+
+    def __reset_spd(self):
+        self.spd = 0
+        self.pos = 0
+        self.min_pos = 0
+
+    def __update_spd(self, ts):
+        if self.prev:
+            d = ts - self.prev.ts
+            v = self.prev_av
+            w = self.av
+            p = self.spd
+            self.pos += d*d/6*(v+2*w)+d*p
+            self.spd += d*(v+w)/2
+            if self.pos < self.min_pos:
+                self.min_pos = self.pos
+
+        self.prev_av = self.av
+
+    def __update_updown(self, ts, gx, gy, gz):
+        thup = self.UD_UP_THRESH - (self.UD_HIST if self.updown > 0 else 0)
+        thdn = self.UD_DOWN_THRESH + (self.UD_HIST if self.updown < 0 else 0)
+
+        if gx * gx + gz * gz > self.UD_SIDE_ROT2_MAX:
+            self.updown = 0
+        elif self.av > thup:
+            self.updown = 1
+        elif self.av < thdn:
+            self.updown = -1
+        else:
+            self.updown = 0
+
+        if self.updown:
+            self.window.append((ts, self.updown, self.av, self.gv, gy))
+            self.__update_updown_window(1, self.window[-1])
+            if self.prev:
+                self.udtime += ts - self.prev.ts
+
+        if self.window and self.window[-1][0] > ts - self.RESET_TLEN:
+            ts -= self.WINDOW_TLEN
+        else:
+            self.__reset_spd()
+            self.last_reset = ts
+            self.udtime = 0
+
+        while self.window and self.window[0][0] < ts:
+            self.__update_updown_window(-1, self.window.pop(0))
+
+    def __update_updown_window(self, mult, data):
+        ts, ud, av, gv, gy = data
+        self.gint += gv * mult
+        self.gyint += abs(gy) * mult
+        self.gyint2 += gy * gy * mult
+        if ud > 0:
+            self.ups += mult
+            self.intups += av * mult
+        elif ud < 0:
+            self.downs += mult
+            self.intdowns += av * mult
+
+    def __call__(self, ax, ay, az, gx, gy, gz, ts):
+        yrot_corr = gy * gy * self.SQUAT_ROT_M
+        self.av = hypot(ax + yrot_corr, ay, az) - self.ONE_G
+        self.gv = hypot(gx, gy, gz)
+        self.__update_updown(ts, gx, gy, gz)
+        self.__update_spd(ts)
+
+        if self.prev and self.last_squat == self.prev.ts:
+            self.min_pos = self.pos
+
+        self.prev = DataTuple(ts, ax, ay, az, gx, gy, gz)
+
+        if self.valid_squat:
+            self.last_squat = self.prev.ts
+
+        return chain.from_iterable(starmap(lambda n, _, v: (n + self.name, v(self)), self.PLOT_VALUES))
+
+    def push(self, ts, data):
+        self.buf.append((ts, data))
+
+    def pop(self):
+        return self.buf.pop(0)
+
+    @property
+    def first_ts(self):
+        try:
+            return self.buf[0][0];
+        except IndexError:
+            return None
+
+streams = defaultdict(BandProcessor)
+
+def get_next():
+    smallest = None
+    min_ts = None
+    for proc in streams.values():
+        ts = proc.first_ts
+        if ts is None:
+            return None
+        if min_ts is None or min_ts > ts:
+            min_ts = ts
+            smallest = proc
+    if smallest is None:
+        return None
+    return smallest.pop()
+
+def iter_next():
+    while True:
+        v = get_next()
+        if v is None:
+            break
+        yield v
+
+if len(argv) > 1 and argv[1] == '--styles':
+    name = argv[2] if len(argv) > 2 else ''
+    for n, s in BandProcessor.line_styles(name):
+        print("--style '{}' '{}'".format(n, s))
+    exit(0)
+
+for line in stdin:
+    # column order: "%-15.15s:  a= %+5d %+5d %+5d  g= %+5d %+5d %+5d  ts=%4u.%06u  dt=%1u.%06u  f=%3.2f",
+    name, ax, ay, az, gx, gy, gz, ts, _ = line.split(',', 8)
+    values = map(float, (ax, ay, az, gx, gy, gz, ts))
+
+    proc = streams[name].set_name(name)
+    proc.push(ts, " ".join(map(str, proc(*values))))
+
+    for ts, data in iter_next():
+        print(ts, data)

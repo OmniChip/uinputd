@@ -1,0 +1,11 @@
+band-uinputd
+datalog
+test_squats
+test_wheel
+test_punch
+test_calib
+*.o
+*.s_o
+.*.d
+.*.s_d
+*.so
